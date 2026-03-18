@@ -1,0 +1,47 @@
+name: Обновление расписания
+
+on:
+  schedule:
+    # Каждые 45 минут, Пн-Сб, 6:00-22:00 МСК (UTC+3, значит UTC 3:00-19:00)
+    - cron: '0,45 3-19 * * 1-6'
+  workflow_dispatch: # Ручной запуск из вкладки Actions
+
+jobs:
+  parse:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Получить код
+        uses: actions/checkout@v4
+
+      - name: Установить Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Установить зависимости
+        run: pip install selenium webdriver-manager
+
+      - name: Установить Chrome
+        uses: browser-actions/setup-chrome@v1
+
+      - name: Запустить парсер
+        env:
+          CHRT_LOGIN:    ${{ secrets.CHRT_LOGIN }}
+          CHRT_PASSWORD: ${{ secrets.CHRT_PASSWORD }}
+        run: |
+          # Включаем headless-режим для работы без экрана
+          sed 's|# chrome_options.add_argument("--headless")|chrome_options.add_argument("--headless=new")|' \
+            login_script.py > login_script_ci.py
+          python login_script_ci.py
+
+      - name: Сохранить schedule.json в репозиторий
+        run: |
+          git config user.name  "GitHub Actions Bot"
+          git config user.email "actions@github.com"
+          git add schedule.json
+          # Коммитим только если файл изменился
+          git diff --staged --quiet || \
+            git commit -m "⏰ Расписание обновлено: $(TZ='Asia/Yekaterinburg' date +'%d.%m.%Y %H:%M')"
+          git push
