@@ -2,7 +2,6 @@ name: Обновление расписания
 
 on:
   schedule:
-    # Каждые 45 минут, Пн-Сб, 6:00-22:00 МСК (UTC+3 → UTC 3:00-19:00)
     - cron: '0,45 3-19 * * 1-6'
   workflow_dispatch:
 
@@ -12,7 +11,7 @@ permissions:
 jobs:
   parse:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
 
     steps:
       - name: Получить код
@@ -25,18 +24,11 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Установить зависимости
-        run: pip install selenium webdriver-manager
-
-      - name: Установить Chrome и ChromeDriver
+      - name: Установить Playwright
         run: |
-          wget -q https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
-          sudo apt-get install -y ./google-chrome-stable_current_amd64.deb
-          echo "Chrome: $(google-chrome --version)"
-          # ChromeDriver совместимой версии
-          pip install chromedriver-autoinstall
-          python -c "import chromedriver_autoinstall; chromedriver_autoinstall.install()"
-          chromedriver --version || true
+          pip install playwright
+          playwright install chromium
+          playwright install-deps chromium
 
       - name: Запустить парсер
         env:
@@ -45,7 +37,7 @@ jobs:
           CHRT_PASSWORD: ${{ secrets.CHRT_PASSWORD }}
         run: python login_script.py
 
-      - name: Сохранить schedule.json в репозиторий
+      - name: Сохранить schedule.json
         run: |
           git config user.name  "GitHub Actions Bot"
           git config user.email "actions@github.com"
