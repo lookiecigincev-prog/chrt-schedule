@@ -29,14 +29,51 @@ WAIT_FOR_WEEK  = 15   # максимум ждать расписания при 
 BETWEEN_GROUPS = 2    # пауза между группами при парсинге
 
 # ── CHROME ────────────────────────────────────────────────────────────────────
+import os as _os
+IS_CI = _os.environ.get("CI") == "true"  # True когда запускается в GitHub Actions
+
 chrome_options = Options()
-# chrome_options.add_argument("--headless")
+
+if IS_CI:
+    # Headless-режим для GitHub Actions (без экрана)
+    chrome_options.add_argument("--headless=new")
+
+# Обязательные флаги для работы в контейнере / CI
 chrome_options.add_argument("--no-sandbox")
 chrome_options.add_argument("--disable-dev-shm-usage")
+chrome_options.add_argument("--disable-gpu")
+chrome_options.add_argument("--disable-software-rasterizer")
+chrome_options.add_argument("--disable-extensions")
+chrome_options.add_argument("--disable-background-networking")
+chrome_options.add_argument("--disable-default-apps")
+chrome_options.add_argument("--disable-sync")
+chrome_options.add_argument("--disable-translate")
+chrome_options.add_argument("--mute-audio")
+chrome_options.add_argument("--no-first-run")
+chrome_options.add_argument("--safebrowsing-disable-auto-update")
+chrome_options.add_argument("--remote-debugging-port=9222")
+chrome_options.add_argument("--window-size=1280,900")
+# Увеличиваем таймаут рендерера — важно для Angular-приложений
+chrome_options.add_argument("--renderer-process-limit=1")
+chrome_options.add_argument("--disable-features=VizDisplayCompositor")
 
-service = Service(ChromeDriverManager().install())
-driver  = webdriver.Chrome(service=service, options=chrome_options)
-driver.set_page_load_timeout(30)
+# Используем системный Chrome в CI, webdriver-manager локально
+if IS_CI:
+    service = Service("/usr/bin/google-chrome")
+    try:
+        import subprocess
+        result = subprocess.run(["which", "chromedriver"], capture_output=True, text=True)
+        if result.returncode == 0:
+            service = Service(result.stdout.strip())
+        else:
+            service = Service(ChromeDriverManager().install())
+    except Exception:
+        service = Service(ChromeDriverManager().install())
+else:
+    service = Service(ChromeDriverManager().install())
+
+driver = webdriver.Chrome(service=service, options=chrome_options)
+driver.set_page_load_timeout(60)  # Увеличен таймаут для медленных серверов
 
 # ── УТИЛИТЫ ───────────────────────────────────────────────────────────────────
 MONTHS = {
