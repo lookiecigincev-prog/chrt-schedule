@@ -2,9 +2,13 @@ name: Обновление расписания
 
 on:
   schedule:
-    # Каждые 45 минут, Пн-Сб, 6:00-22:00 МСК (UTC+3, значит UTC 3:00-19:00)
+    # Каждые 45 минут, Пн-Сб, 6:00-22:00 МСК (UTC+3 → UTC 3:00-19:00)
     - cron: '0,45 3-19 * * 1-6'
   workflow_dispatch: # Ручной запуск из вкладки Actions
+
+# ↓ ВАЖНО: даём Actions право писать в репозиторий
+permissions:
+  contents: write
 
 jobs:
   parse:
@@ -14,6 +18,9 @@ jobs:
     steps:
       - name: Получить код
         uses: actions/checkout@v4
+        with:
+          # Токен с правом записи
+          token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Установить Python
         uses: actions/setup-python@v5
@@ -31,7 +38,6 @@ jobs:
           CHRT_LOGIN:    ${{ secrets.CHRT_LOGIN }}
           CHRT_PASSWORD: ${{ secrets.CHRT_PASSWORD }}
         run: |
-          # Включаем headless-режим для работы без экрана
           sed 's|# chrome_options.add_argument("--headless")|chrome_options.add_argument("--headless=new")|' \
             login_script.py > login_script_ci.py
           python login_script_ci.py
@@ -41,7 +47,6 @@ jobs:
           git config user.name  "GitHub Actions Bot"
           git config user.email "actions@github.com"
           git add schedule.json
-          # Коммитим только если файл изменился
           git diff --staged --quiet || \
-            git commit -m "⏰ Расписание обновлено: $(TZ='Asia/Yekaterinburg' date +'%d.%m.%Y %H:%M')"
+            git commit -m "⏰ Расписание: $(TZ='Asia/Yekaterinburg' date +'%d.%m.%Y %H:%M')"
           git push
