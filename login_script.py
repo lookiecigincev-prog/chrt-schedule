@@ -1,21 +1,20 @@
-from selenium import webdriver
-from selenium.webdriver.common.by import By
-from selenium.webdriver.chrome.service import Service
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import TimeoutException, NoSuchElementException
-from webdriver_manager.chrome import ChromeDriverManager
-import time
+"""
+Парсер расписания ЧРТ — использует Playwright (работает в GitHub Actions CI)
+Установка: pip install playwright && playwright install chromium
+"""
+import os
 import json
 import re
+import time
+from datetime import date, timedelta
+from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 
 # ── НАСТРОЙКИ ─────────────────────────────────────────────────────────────────
 BASE_URL     = "https://poo.edu-74.ru"
 SCHEDULE_URL = f"{BASE_URL}/schedule/#/timetable"
-import os
 LOGIN    = os.environ.get("CHRT_LOGIN",    "")
 PASSWORD = os.environ.get("CHRT_PASSWORD", "")
+
 if not LOGIN or not PASSWORD:
     raise Exception(
         "Логин и пароль не заданы!\n"
@@ -23,57 +22,12 @@ if not LOGIN or not PASSWORD:
         "В GitHub: Settings → Secrets → CHRT_LOGIN и CHRT_PASSWORD"
     )
 
+IS_CI = os.environ.get("CI") == "true"
+
 # Паузы (в секундах)
-WAIT_FOR_H2    = 2    # максимум ждать названия группы при переборе (короткий!)
-WAIT_FOR_WEEK  = 15   # максимум ждать расписания при парсинге
-BETWEEN_GROUPS = 2    # пауза между группами при парсинге
-
-# ── CHROME ────────────────────────────────────────────────────────────────────
-import os as _os
-IS_CI = _os.environ.get("CI") == "true"  # True когда запускается в GitHub Actions
-
-chrome_options = Options()
-
-if IS_CI:
-    # Headless-режим для GitHub Actions (без экрана)
-    chrome_options.add_argument("--headless=new")
-
-# Обязательные флаги для работы в контейнере / CI
-chrome_options.add_argument("--no-sandbox")
-chrome_options.add_argument("--disable-dev-shm-usage")
-chrome_options.add_argument("--disable-gpu")
-chrome_options.add_argument("--disable-software-rasterizer")
-chrome_options.add_argument("--disable-extensions")
-chrome_options.add_argument("--disable-background-networking")
-chrome_options.add_argument("--disable-default-apps")
-chrome_options.add_argument("--disable-sync")
-chrome_options.add_argument("--disable-translate")
-chrome_options.add_argument("--mute-audio")
-chrome_options.add_argument("--no-first-run")
-chrome_options.add_argument("--safebrowsing-disable-auto-update")
-chrome_options.add_argument("--remote-debugging-port=9222")
-chrome_options.add_argument("--window-size=1280,900")
-# Увеличиваем таймаут рендерера — важно для Angular-приложений
-chrome_options.add_argument("--renderer-process-limit=1")
-chrome_options.add_argument("--disable-features=VizDisplayCompositor")
-
-# Используем системный Chrome в CI, webdriver-manager локально
-if IS_CI:
-    service = Service("/usr/bin/google-chrome")
-    try:
-        import subprocess
-        result = subprocess.run(["which", "chromedriver"], capture_output=True, text=True)
-        if result.returncode == 0:
-            service = Service(result.stdout.strip())
-        else:
-            service = Service(ChromeDriverManager().install())
-    except Exception:
-        service = Service(ChromeDriverManager().install())
-else:
-    service = Service(ChromeDriverManager().install())
-
-driver = webdriver.Chrome(service=service, options=chrome_options)
-driver.set_page_load_timeout(60)  # Увеличен таймаут для медленных серверов
+WAIT_FOR_H2    = 3000   # мс — ждать название группы при переборе
+WAIT_FOR_WEEK  = 20000  # мс — ждать появления расписания
+BETWEEN_GROUPS = 2      # сек — пауза между группами
 
 # ── УТИЛИТЫ ───────────────────────────────────────────────────────────────────
 MONTHS = {
@@ -92,7 +46,6 @@ def parse_date_from_week_header(header_text):
 
 def get_date_for_day(week_start_str, day_short_name):
     DAYS_ORDER = ['Пн', 'Вт', 'Ср', 'Чт', 'Пт', 'Сб', 'Вс']
-    from datetime import date, timedelta
     year, month, day = map(int, week_start_str.split('-'))
     monday = date(year, month, day)
     try:
@@ -100,272 +53,257 @@ def get_date_for_day(week_start_str, day_short_name):
     except ValueError:
         return week_start_str
 
-# ── ОБНАРУЖЕНИЕ ГРУПП (перебор ID) ───────────────────────────────────────────
-def discover_groups():
-    """
-    Перебираем ID 1–100. На каждой странице ждём появления ссылки
-    с непустым названием группы. Таймаут короткий (2с) — несуществующие
-    ID отсеиваются быстро, существующие загружаются за это время.
-    """
+# ── ЗАКРЫТИЕ МОДАЛЬНЫХ ОКОН ───────────────────────────────────────────────────
+def close_modals(page):
+    """Закрывает все модальные окна ошибок. Возвращает True если окно было."""
+    found = False
+    modals = page.query_selector_all('div.placeholder div.litebox')
+    for modal in modals:
+        try:
+            if not modal.is_visible():
+                continue
+            found = True
+            try:
+                text = modal.query_selector('p.big')
+                if text:
+                    print(f"  ⚠️  {text.inner_text().strip()}")
+            except Exception:
+                pass
+            for sel in ('span.close', 'button'):
+                try:
+                    btn = modal.query_selector(sel)
+                    if btn:
+                        btn.click()
+                        break
+                except Exception:
+                    pass
+            page.wait_for_timeout(300)
+        except Exception:
+            pass
+    return found
+
+# ── ОБНАРУЖЕНИЕ ГРУПП ─────────────────────────────────────────────────────────
+def discover_groups(page):
     print("\n── Обнаружение групп (перебор ID 1–100) ────────────────")
     groups = {}
 
-    def group_name_loaded(d):
-        """Условие: ссылка с названием группы загружена и непустая."""
-        try:
-            link = d.find_element(By.CSS_SELECTOR, 'hgroup h2 a.ng-binding')
-            text = link.text.strip()
-            # Текст должен быть непустым и содержать что-то кроме слова "Группа"
-            return text and text.lower() != 'группа'
-        except Exception:
-            return False
-
     for gid in range(1, 101):
-        driver.get(f"{BASE_URL}/schedule/#/timetable/studentGroup/{gid}")
+        page.goto(f"{BASE_URL}/schedule/#/timetable/studentGroup/{gid}", wait_until='domcontentloaded')
+
+        # Ждём появления ссылки с непустым именем группы
         try:
-            WebDriverWait(driver, WAIT_FOR_H2).until(group_name_loaded)
-            link = driver.find_element(By.CSS_SELECTOR, 'hgroup h2 a.ng-binding')
-            raw  = link.text.strip()
+            page.wait_for_function(
+                """() => {
+                    const a = document.querySelector('hgroup h2 a.ng-binding');
+                    return a && a.innerText.trim() && a.innerText.trim().toLowerCase() !== 'группа';
+                }""",
+                timeout=WAIT_FOR_H2
+            )
+            link = page.query_selector('hgroup h2 a.ng-binding')
+            raw  = link.inner_text().strip()
             name = re.sub(r'^Группа\s+', '', raw, flags=re.IGNORECASE).strip()
-            # Проверяем не вылетела ли сразу ошибка загрузки расписания
-            if close_error_modal():
+
+            if close_modals(page):
                 print(f"  ❌ {name} ({gid}): ошибка загрузки, пропускаем")
-            else:
-                groups[name] = gid
-                print(f"  ✅ {name}: {gid}")
-        except TimeoutException:
+                continue
+
+            groups[name] = gid
+            print(f"  ✅ {name}: {gid}")
+        except PWTimeout:
             print(f"  {gid}: пропускаем")
 
     return groups
 
 # ── ПАРСИНГ РАСПИСАНИЯ ОДНОЙ ГРУППЫ ──────────────────────────────────────────
-def close_error_modal():
-    """
-    Закрывает ВСЕ открытые модальные окна ошибок.
-    Возвращает True если хотя бы одно окно было найдено.
-    Обрабатывает оба варианта:
-      - "Ошибка загрузки расписания занятий"
-      - "Произошла ошибка получения расписания занятий"
-    """
-    modals = driver.find_elements(By.CSS_SELECTOR, 'div.placeholder div.litebox')
-    if not modals:
-        return False
-    found = False
-    for modal in modals:
-        try:
-            if not modal.is_displayed():
-                continue
-            found = True
-            try:
-                text = modal.find_element(By.CSS_SELECTOR, 'p.big').text.strip()
-                print(f"  ⚠️  {text}")
-            except Exception:
-                pass
-            # Закрываем — сначала крестик, потом кнопка
-            closed = False
-            for selector in ('span.close', 'button'):
-                try:
-                    modal.find_element(By.CSS_SELECTOR, selector).click()
-                    closed = True
-                    break
-                except Exception:
-                    pass
-            if not closed:
-                # Крайний случай — JS click
-                try:
-                    driver.execute_script("arguments[0].click();",
-                        modal.find_element(By.CSS_SELECTOR, 'button'))
-                except Exception:
-                    pass
-            time.sleep(0.3)  # небольшая пауза чтобы модалка закрылась
-        except Exception:
-            pass
-    return found
-
-def parse_group_schedule(group_name, group_id):
+def parse_group_schedule(page, group_name, group_id):
     print(f"\n  Парсим {group_name} (id={group_id})...")
-    driver.get(f"{BASE_URL}/schedule/#/timetable/studentGroup/{group_id}")
+    page.goto(f"{BASE_URL}/schedule/#/timetable/studentGroup/{group_id}", wait_until='domcontentloaded')
 
-    # Ждём пока загрузится либо расписание, либо ошибка(и)
+    # Ждём расписание или ошибку
     try:
-        WebDriverWait(driver, WAIT_FOR_WEEK).until(lambda d:
-            d.find_elements(By.CSS_SELECTOR, 'div.week') or
-            d.find_elements(By.CSS_SELECTOR, 'div.placeholder div.litebox')
+        page.wait_for_function(
+            "() => document.querySelector('div.week') || document.querySelector('div.placeholder div.litebox')",
+            timeout=WAIT_FOR_WEEK
         )
-    except TimeoutException:
-        print(f"  ❌ Страница не ответила, пропускаем")
+    except PWTimeout:
+        print(f"  ❌ Таймаут, пропускаем")
         return []
 
-    # Даём время — может появиться второе модальное окно
-    time.sleep(0.5)
+    page.wait_for_timeout(500)
 
-    # Закрываем все модалки. Если хоть одна была — пропускаем группу
-    if close_error_modal():
-        print(f"  ❌ Ошибка загрузки расписания, пропускаем {group_name}")
+    if close_modals(page):
+        print(f"  ❌ Ошибка загрузки расписания, пропускаем")
         return []
 
-    # Расписание загрузилось — небольшая пауза чтобы Angular достроил все блоки
-    time.sleep(2)
+    page.wait_for_timeout(1500)
 
     lessons = []
     counter = 0
 
-    try:
-        for week in driver.find_elements(By.CSS_SELECTOR, 'div.week'):
-            week_start = None
+    week_blocks = page.query_selector_all('div.week')
+    for week in week_blocks:
+        week_start = None
+        try:
+            h4 = week.query_selector('h4')
+            if h4:
+                week_start = parse_date_from_week_header(h4.inner_text())
+        except Exception:
+            pass
+
+        for day_el in week.query_selector_all('dl[x-ng-repeat="day in week"]'):
+            day_short = ''
             try:
-                week_start = parse_date_from_week_header(
-                    week.find_element(By.TAG_NAME, 'h4').text
-                )
+                big = day_el.query_selector('dt big')
+                if big:
+                    day_short = big.inner_text().strip()
             except Exception:
                 pass
 
-            for day_el in week.find_elements(By.CSS_SELECTOR, 'dl[x-ng-repeat="day in week"]'):
-                day_short = ''
+            lesson_date = get_date_for_day(week_start, day_short) if week_start else ''
+
+            for event in day_el.query_selector_all('div.event'):
+                pair_number = start_time = end_time = ''
                 try:
-                    day_short = day_el.find_element(By.CSS_SELECTOR, 'dt big').text.strip()
+                    num = event.query_selector('div.time div')
+                    if num:
+                        pair_number = num.inner_text().strip()
                 except Exception:
                     pass
-
-                lesson_date = get_date_for_day(week_start, day_short) if week_start else ''
-
-                for event in day_el.find_elements(By.CSS_SELECTOR, 'div.event'):
-                    pair_number = start_time = end_time = ''
-                    try:
-                        pair_number = event.find_element(
-                            By.CSS_SELECTOR, 'div.time div').text.strip()
-                    except Exception:
-                        pass
-                    try:
-                        raw   = event.find_element(
-                            By.CSS_SELECTOR, 'div.time small').text.strip()
+                try:
+                    small = event.query_selector('div.time small')
+                    if small:
+                        raw   = small.inner_text().strip()
                         clean = raw.replace('–', '-').replace('—', '-')
                         if '-' in clean:
                             start_time, end_time = [p.strip() for p in clean.split('-', 1)]
+                except Exception:
+                    pass
+
+                lesson_divs = event.query_selector_all('div.lessons div.lesson')
+                if not lesson_divs:
+                    continue
+
+                for ld in lesson_divs:
+                    subject = classroom = teacher = ''
+                    try:
+                        el = ld.query_selector('span.subject')
+                        if el: subject = el.inner_text().strip()
+                    except Exception:
+                        pass
+                    try:
+                        el = ld.query_selector('small.classroom')
+                        if el: classroom = el.inner_text().strip().replace('ауд. ', '')
+                    except Exception:
+                        pass
+                    try:
+                        el = ld.query_selector('small.teacher')
+                        if el: teacher = el.inner_text().strip()
                     except Exception:
                         pass
 
-                    lesson_divs = event.find_elements(
-                        By.CSS_SELECTOR, 'div.lessons div.lesson')
-                    if not lesson_divs:
+                    if not subject:
                         continue
 
-                    for ld in lesson_divs:
-                        subject = classroom = teacher = ''
-                        try:
-                            subject   = ld.find_element(
-                                By.CSS_SELECTOR, 'span.subject').text.strip()
-                        except Exception:
-                            pass
-                        try:
-                            classroom = ld.find_element(
-                                By.CSS_SELECTOR, 'small.classroom').text.strip().replace('ауд. ', '')
-                        except Exception:
-                            pass
-                        try:
-                            teacher   = ld.find_element(
-                                By.CSS_SELECTOR, 'small.teacher').text.strip()
-                        except Exception:
-                            pass
-
-                        if not subject:
-                            continue
-
-                        counter += 1
-                        lessons.append({
-                            'id':          str(counter),
-                            'date':        lesson_date,
-                            'number':      pair_number,
-                            'startTime':   f"{lesson_date}T{start_time}:00" if lesson_date and start_time else start_time,
-                            'endTime':     f"{lesson_date}T{end_time}:00"   if lesson_date and end_time   else end_time,
-                            'subjectName': subject,
-                            'type':        '',
-                            'roomName':    classroom,
-                            'teacherName': teacher,
-                            'className':   group_name,
-                        })
-    except Exception as e:
-        print(f"  Ошибка парсинга {group_name}: {e}")
+                    counter += 1
+                    lessons.append({
+                        'id':          str(counter),
+                        'date':        lesson_date,
+                        'number':      pair_number,
+                        'startTime':   f"{lesson_date}T{start_time}:00" if lesson_date and start_time else start_time,
+                        'endTime':     f"{lesson_date}T{end_time}:00"   if lesson_date and end_time   else end_time,
+                        'subjectName': subject,
+                        'type':        '',
+                        'roomName':    classroom,
+                        'teacherName': teacher,
+                        'className':   group_name,
+                    })
 
     print(f"  → {len(lessons)} уроков")
     return lessons
 
 # ── MAIN ──────────────────────────────────────────────────────────────────────
-try:
-    # Авторизация
-    print("── Авторизация ──────────────────────────────────────────")
-    driver.get(SCHEDULE_URL)
-    WebDriverWait(driver, 10).until(
-        EC.presence_of_element_located((By.TAG_NAME, "body")))
-
-    # Снимаем ng-hide с формы
-    driver.execute_script("""
-        var s = document.createElement('style');
-        s.innerHTML = '.ng-hide { display: block !important; }';
-        document.head.appendChild(s);
-    """)
-    WebDriverWait(driver, 10).until(
-        EC.presence_of_element_located((By.NAME, "formAuth")))
-    time.sleep(2)
-
-    form   = driver.find_element(By.NAME, "formAuth")
-    inputs = form.find_elements(By.TAG_NAME, "input")
-    login_field = password_field = None
-    for inp in inputs:
-        if inp.get_attribute("type") == "text"     or inp.get_attribute("name") == "login":
-            login_field    = inp
-        if inp.get_attribute("type") == "password" or inp.get_attribute("name") == "password":
-            password_field = inp
-
-    if not login_field or not password_field:
-        raise Exception("Поля логина/пароля не найдены")
-
-    driver.execute_script("arguments[0].value = arguments[1];", login_field,    LOGIN)
-    driver.execute_script("arguments[0].value = arguments[1];", password_field, PASSWORD)
+with sync_playwright() as pw:
+    print("── Запуск браузера ──────────────────────────────────────")
+    browser = pw.chromium.launch(
+        headless=True,
+        args=[
+            '--no-sandbox',
+            '--disable-dev-shm-usage',
+            '--disable-gpu',
+            '--disable-setuid-sandbox',
+            '--no-zygote',
+            '--single-process',
+        ]
+    )
+    context = browser.new_context(
+        viewport={'width': 1280, 'height': 900},
+        user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36'
+    )
+    page = context.new_page()
+    page.set_default_timeout(30000)
 
     try:
-        driver.execute_script("arguments[0].click();",
-            driver.find_element(By.CSS_SELECTOR,
-                "form[name='formAuth'] button[type='submit']"))
-    except Exception:
-        driver.execute_script("arguments[0].submit();", form)
+        # ── Авторизация ───────────────────────────────────────────────────────
+        print("── Авторизация ──────────────────────────────────────────")
+        page.goto(SCHEDULE_URL, wait_until='domcontentloaded')
 
-    # Ждём редиректа после логина
-    WebDriverWait(driver, 15).until(lambda d: d.current_url != SCHEDULE_URL)
-    # Ждём полной загрузки Angular после логина
-    WebDriverWait(driver, 15).until(
-        EC.presence_of_element_located((By.CSS_SELECTOR, 'hgroup, div.week, nav.navbar')))
-    time.sleep(2)
-    print(f"✅ Авторизован. URL: {driver.current_url}")
+        # Снимаем ng-hide с формы
+        page.add_style_tag(content='.ng-hide { display: block !important; }')
 
-    # Обнаружение групп
-    groups = discover_groups()
+        page.wait_for_selector('form[name="formAuth"]', timeout=15000)
+        page.wait_for_timeout(1500)
 
-    if not groups:
-        raise Exception("Не удалось найти ни одной группы")
+        # Заполняем форму
+        form = page.query_selector('form[name="formAuth"]')
+        for inp in form.query_selector_all('input'):
+            t = inp.get_attribute('type') or ''
+            n = inp.get_attribute('name') or ''
+            if t == 'text'     or n == 'login':    inp.fill(LOGIN)
+            if t == 'password' or n == 'password': inp.fill(PASSWORD)
 
-    print(f"\n✅ Найдено групп: {len(groups)}")
-    for name, gid in sorted(groups.items()):
-        print(f"   {name}: {gid}")
+        # Клик по кнопке submit
+        try:
+            form.query_selector('button[type="submit"]').click()
+        except Exception:
+            page.evaluate("document.querySelector('form[name=\"formAuth\"]').submit()")
 
-    # Парсинг расписания
-    print("\n── Парсинг расписания ───────────────────────────────────")
-    schedule_data = {}
-    for group_name, group_id in sorted(groups.items()):
-        schedule_data[group_name] = parse_group_schedule(group_name, group_id)
-        time.sleep(BETWEEN_GROUPS)
+        # Ждём редиректа
+        page.wait_for_function(
+            f"() => window.location.href !== '{SCHEDULE_URL}'",
+            timeout=15000
+        )
+        page.wait_for_timeout(2000)
+        print(f"✅ Авторизован. URL: {page.url}")
 
-    # Сохранение
-    with open('schedule.json', 'w', encoding='utf-8') as f:
-        json.dump(schedule_data, f, ensure_ascii=False, indent=4)
+        # ── Обнаружение групп ─────────────────────────────────────────────────
+        groups = discover_groups(page)
 
-    total = sum(len(v) for v in schedule_data.values())
-    print(f"\n✅ Готово! {total} уроков, {len(schedule_data)} групп → schedule.json")
+        if not groups:
+            raise Exception("Не найдено ни одной группы")
 
-except Exception as e:
-    import traceback
-    print(f"\n❌ Ошибка: {e}")
-    traceback.print_exc()
+        print(f"\n✅ Групп найдено: {len(groups)}")
+        for name, gid in sorted(groups.items()):
+            print(f"   {name}: {gid}")
 
-finally:
-    driver.quit()
+        # ── Парсинг расписания ────────────────────────────────────────────────
+        print("\n── Парсинг расписания ───────────────────────────────────")
+        schedule_data = {}
+        for group_name, group_id in sorted(groups.items()):
+            schedule_data[group_name] = parse_group_schedule(page, group_name, group_id)
+            time.sleep(BETWEEN_GROUPS)
+
+        # ── Сохранение ────────────────────────────────────────────────────────
+        with open('schedule.json', 'w', encoding='utf-8') as f:
+            json.dump(schedule_data, f, ensure_ascii=False, indent=4)
+
+        total = sum(len(v) for v in schedule_data.values())
+        print(f"\n✅ Готово! {total} уроков, {len(schedule_data)} групп → schedule.json")
+
+    except Exception as e:
+        import traceback
+        print(f"\n❌ Ошибка: {e}")
+        traceback.print_exc()
+        browser.close()
+        exit(1)
+
+    browser.close()
